@@ -449,12 +449,20 @@ def main():
     watch_timer.start(WATCH_INTERVAL_MS)
     watch_timer.timeout.connect(on_watch_tick)
 
-    # 완료 처리 — 사자 클릭 시 호출
-    def on_pet_clicked(event):
+    # 자식 위젯 마우스 이벤트를 부모(pet)로 통과 — 핸들러는 pet 하나만 관리
+    for w in (lion_label, msg_label, hint_label):
+        w.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    _drag_origin = None   # 드래그 시작 시 pet 좌상단 기준점
+    _drag_start = None    # 드래그 시작 커서 위치 (5px 임계 판정용)
+    _is_dragging = False  # True 면 드래그 중, False 면 클릭 가능성
+
+    def on_complete():
+        """완료 처리 — 감시 중단 → 축하 모달 → 앱 종료."""
         watch_timer.stop()
-        # 자식 위젯 클릭도 차단 (자식이 이벤트를 먹으므로 자식에도 설정)
-        for w in (pet, lion_label, msg_label, hint_label):
-            w.mousePressEvent = lambda e: None
+        pet.mousePressEvent = lambda e: None
+        pet.mouseMoveEvent = lambda e: None
+        pet.mouseReleaseEvent = lambda e: None
         pet.hide()
 
         msg = random.choice(CELEBRATE)
@@ -463,9 +471,36 @@ def main():
 
         app.quit()
 
-    # 자식 위젯 클릭이 부모(pet)로 올라오지 않으므로 각각에 핸들러 설정
-    for w in (pet, lion_label, msg_label, hint_label):
-        w.mousePressEvent = on_pet_clicked
+    def pet_mouse_press(event):
+        nonlocal _drag_origin, _drag_start, _is_dragging
+        if event.button() == Qt.LeftButton:
+            _drag_start = event.globalPos()
+            _drag_origin = event.globalPos() - pet.frameGeometry().topLeft()
+            _is_dragging = False
+            event.accept()
+
+    def pet_mouse_move(event):
+        nonlocal _is_dragging
+        if event.buttons() & Qt.LeftButton and _drag_start is not None:
+            # 5px 초과 이동 시 드래그로 확정
+            if not _is_dragging and (event.globalPos() - _drag_start).manhattanLength() > 5:
+                _is_dragging = True
+            if _is_dragging:
+                pet.move(event.globalPos() - _drag_origin)
+                event.accept()
+
+    def pet_mouse_release(event):
+        nonlocal _drag_start, _is_dragging
+        if event.button() == Qt.LeftButton:
+            if not _is_dragging:
+                on_complete()   # 드래그 없이 뗐으면 클릭 → 완료
+            _drag_start = None
+            _is_dragging = False
+            event.accept()
+
+    pet.mousePressEvent = pet_mouse_press
+    pet.mouseMoveEvent = pet_mouse_move
+    pet.mouseReleaseEvent = pet_mouse_release
 
     sys.exit(app.exec_())
 
