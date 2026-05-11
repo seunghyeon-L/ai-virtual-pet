@@ -6,12 +6,15 @@ import sys
 import os
 import signal
 import random
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPixmap
+import math
+from PyQt5.QtCore import (
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect,
+)
+from PyQt5.QtGui import QPixmap, QPainter, QColor
 from PyQt5.QtWidgets import (
     QApplication, QLabel, QWidget,
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QGraphicsOpacityEffect,
 )
 
 from watcher import get_active_window_title, close_active_window
@@ -254,7 +257,7 @@ class GoalDialog(DraggableDialog):
 
 
 class CelebrateDialog(DraggableDialog):
-    """완료 클릭 시 축하 모달."""
+    """완료 클릭 시 축하 모달. 별 폭발 애니메이션은 CelebrationOverlay 가 담당."""
 
     def __init__(self, goals: list[str], message: str):
         super().__init__()
@@ -324,6 +327,171 @@ class CelebrateDialog(DraggableDialog):
             super().keyPressEvent(event)
 
 
+class CelebrationOverlay(QWidget):
+    """전체 화면을 덮는 반투명 어둠 + 중앙 캐릭터 페이드인/아웃 + 별 폭발 → CelebrateDialog."""
+
+    STAR_COUNT = 14                 # 사방으로 튀는 별 개수
+    STAR_DISTANCE = (220, 380)      # 사자 중심으로부터 날아가는 거리 범위(px)
+    STAR_DURATION_MS = 900          # 별 비행 시간 (= BURST_HOLD_MS)
+    STAR_FONT_SIZE = 44
+    STAR_BOX = 64
+    DIM_ALPHA = 150                 # 어둠 알파 (0~255)
+    FADE_IN_MS = 280                # 어둠+사자 동시 페이드인
+    BURST_HOLD_MS = 900             # 별 폭발 + 사자 유지 시간
+    FADE_OUT_MS = 350               # 어둠+사자 동시 페이드아웃
+    LION_SIZE = 220                 # 중앙 사자 크기
+
+    def __init__(self, goals: list[str], message: str, on_done):
+        super().__init__()
+        self.goals = goals
+        self.message = message
+        self.on_done = on_done
+        self._anims = []
+        self._started = False
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.setWindowOpacity(0.0)
+
+        # 중앙 사자 — 별 발사 기준점이자 페이드 대상
+        self.lion_label = QLabel(self)
+        self.lion_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.lion_label.setAlignment(Qt.AlignCenter)
+        self.lion_label.setStyleSheet("background: transparent;")
+        self.lion_label.resize(self.LION_SIZE, self.LION_SIZE)
+        px = _lion_pixmap("celebrate", self.LION_SIZE)
+        if not px.isNull():
+            self.lion_label.setPixmap(px)
+        else:
+            self.lion_label.setText("🥳")
+            self.lion_label.setStyleSheet(
+                f"font-size: {self.LION_SIZE - 40}px; background: transparent;"
+            )
+        center = self.rect().center()
+        self.lion_label.move(
+            center.x() - self.LION_SIZE // 2,
+            center.y() - self.LION_SIZE // 2,
+        )
+
+        self.lion_effect = QGraphicsOpacityEffect(self.lion_label)
+        self.lion_effect.setOpacity(0.0)
+        self.lion_label.setGraphicsEffect(self.lion_effect)
+
+    def paintEvent(self, event):
+        # 위젯 자체는 투명 — 여기서 반투명 어둠을 직접 칠한다.
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, self.DIM_ALPHA))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._started:
+            return
+        self._started = True
+
+        # Phase A — 어둠 + 사자 동시 페이드인
+        self._animate_opacity(self, 0.0, 1.0, self.FADE_IN_MS)
+        self._animate_opacity(self.lion_effect, 0.0, 1.0, self.FADE_IN_MS)
+
+        # Phase B — 페이드인 끝나면 별 폭발 (사자는 표시 유지)
+        QTimer.singleShot(self.FADE_IN_MS, self._burst_stars)
+
+        # Phase C — 별 폭발 끝나면 어둠 + 사자 동시 페이드아웃
+        QTimer.singleShot(
+            self.FADE_IN_MS + self.BURST_HOLD_MS,
+            self._fade_out,
+        )
+
+        # Phase D — 페이드아웃 끝나면 알람 다이얼로그
+        QTimer.singleShot(
+            self.FADE_IN_MS + self.BURST_HOLD_MS + self.FADE_OUT_MS,
+            self._show_alert,
+        )
+
+    def _animate_opacity(self, target, start, end, duration_ms, easing=None):
+        prop = b"windowOpacity" if target is self else b"opacity"
+        anim = QPropertyAnimation(target, prop)
+        anim.setDuration(duration_ms)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        if easing is not None:
+            anim.setEasingCurve(easing)
+        anim.start()
+        self._anims.append(anim)
+        return anim
+
+    def _fade_out(self):
+        self._animate_opacity(self, 1.0, 0.0, self.FADE_OUT_MS)
+        self._animate_opacity(self.lion_effect, 1.0, 0.0, self.FADE_OUT_MS)
+
+    def _burst_stars(self):
+        center = self.rect().center()
+        for i in range(self.STAR_COUNT):
+            angle = (2 * math.pi * i) / self.STAR_COUNT + random.uniform(-0.15, 0.15)
+            distance = random.randint(*self.STAR_DISTANCE)
+
+            star = QLabel("⭐", self)
+            star.setStyleSheet(
+                f"font-size: {self.STAR_FONT_SIZE}px; background: transparent;"
+            )
+            star.setAttribute(Qt.WA_TransparentForMouseEvents)
+            star.setAlignment(Qt.AlignCenter)
+
+            start_rect = QRect(
+                center.x() - self.STAR_BOX // 2,
+                center.y() - self.STAR_BOX // 2,
+                self.STAR_BOX, self.STAR_BOX,
+            )
+            end_rect = QRect(
+                int(center.x() + math.cos(angle) * distance) - self.STAR_BOX // 2,
+                int(center.y() + math.sin(angle) * distance) - self.STAR_BOX // 2,
+                self.STAR_BOX, self.STAR_BOX,
+            )
+            star.setGeometry(start_rect)
+            star.show()
+            star.raise_()
+
+            pos_anim = QPropertyAnimation(star, b"geometry")
+            pos_anim.setDuration(self.STAR_DURATION_MS)
+            pos_anim.setStartValue(start_rect)
+            pos_anim.setEndValue(end_rect)
+            pos_anim.setEasingCurve(QEasingCurve.OutQuad)
+
+            effect = QGraphicsOpacityEffect(star)
+            effect.setOpacity(1.0)
+            star.setGraphicsEffect(effect)
+            fade = QPropertyAnimation(effect, b"opacity")
+            fade.setDuration(self.STAR_DURATION_MS)
+            fade.setStartValue(1.0)
+            fade.setKeyValueAt(0.5, 1.0)
+            fade.setEndValue(0.0)
+            fade.finished.connect(star.deleteLater)
+
+            pos_anim.start()
+            fade.start()
+            self._anims.extend([pos_anim, fade])
+
+    def _show_alert(self):
+        # 어둠은 이미 0이지만 명시적으로 숨겨서 클릭 차단도 제거
+        self.hide()
+
+        dialog = CelebrateDialog(self.goals, self.message)
+        screen = QApplication.primaryScreen().geometry()
+        dialog.move(
+            screen.center().x() - dialog.width() // 2,
+            screen.center().y() - dialog.height() // 2,
+        )
+        dialog.exec_()
+        self.close()
+        if self.on_done:
+            self.on_done()
+
+
 def main():
     app = QApplication(sys.argv)
 
@@ -344,6 +512,9 @@ def main():
     pet = QWidget()
     pet.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
     pet.setAttribute(Qt.WA_TranslucentBackground)       # 컨테이너 배경 투명
+    # 너비를 사자 크기에 고정 — 메시지 길이에 따라 위젯이 가로로 늘어나면
+    # 가운데 정렬된 사자가 옆으로 흔들리는 현상이 생긴다. 메시지는 wordWrap 으로 줄바꿈.
+    pet.setFixedWidth(CHARACTER_SIZE)
 
     pet_layout = QVBoxLayout(pet)
     pet_layout.setContentsMargins(0, 0, 0, 0)
@@ -370,11 +541,19 @@ def main():
 
     screen = app.primaryScreen().availableGeometry()
 
+    # 사용자가 드래그하면 위젯 하단-좌측을 앵커로 저장. None 이면 기본 우하단.
+    # 하단 기준이라야 메시지가 위로 펼쳐질 때 사자 본체가 제자리에 머무른다.
+    _user_anchor = None
+
     def reposition():
-        pet.move(
-            screen.right() - pet.width() - MARGIN_FROM_EDGE,
-            screen.bottom() - pet.height() - MARGIN_FROM_EDGE,
-        )
+        if _user_anchor is None:
+            pet.move(
+                screen.right() - pet.width() - MARGIN_FROM_EDGE,
+                screen.bottom() - pet.height() - MARGIN_FROM_EDGE,
+            )
+        else:
+            x_left, y_bottom = _user_anchor
+            pet.move(x_left, y_bottom - pet.height())
 
     def render_lion(message=None, mood="default"):
         # 메시지 유무에 따라 msg_label 표시/숨김
@@ -456,9 +635,10 @@ def main():
     _drag_origin = None   # 드래그 시작 시 pet 좌상단 기준점
     _drag_start = None    # 드래그 시작 커서 위치 (5px 임계 판정용)
     _is_dragging = False  # True 면 드래그 중, False 면 클릭 가능성
+    _overlay_ref = []     # CelebrationOverlay GC 방지용 보관
 
     def on_complete():
-        """완료 처리 — 감시 중단 → 축하 모달 → 앱 종료."""
+        """완료 처리 — 감시 중단 → 전체화면 별 폭발 오버레이 → 축하 모달 → 앱 종료."""
         watch_timer.stop()
         pet.mousePressEvent = lambda e: None
         pet.mouseMoveEvent = lambda e: None
@@ -466,10 +646,9 @@ def main():
         pet.hide()
 
         msg = random.choice(CELEBRATE)
-        celebrate = CelebrateDialog(goals, msg)
-        celebrate.exec_()
-
-        app.quit()
+        overlay = CelebrationOverlay(goals, msg, on_done=app.quit)
+        _overlay_ref.append(overlay)   # 지역변수만으로는 GC 가능성 있음
+        overlay.show()
 
     def pet_mouse_press(event):
         nonlocal _drag_origin, _drag_start, _is_dragging
@@ -490,10 +669,12 @@ def main():
                 event.accept()
 
     def pet_mouse_release(event):
-        nonlocal _drag_start, _is_dragging
+        nonlocal _drag_start, _is_dragging, _user_anchor
         if event.button() == Qt.LeftButton:
             if not _is_dragging:
                 on_complete()   # 드래그 없이 뗐으면 클릭 → 완료
+            else:
+                _user_anchor = (pet.x(), pet.y() + pet.height())
             _drag_start = None
             _is_dragging = False
             event.accept()
