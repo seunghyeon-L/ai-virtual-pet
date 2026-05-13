@@ -21,6 +21,32 @@ def get_active_window_title() -> str:
     return win32gui.GetWindowText(hwnd)                # 창 타이틀바의 텍스트 반환 (없으면 자동으로 빈 문자열)
 
 
+def get_active_window_info() -> tuple[int, str]:
+    """현재 포그라운드 창의 (핸들, 제목)을 반환. 활성 창이 없거나 자기 자신이면 (0, "")."""
+    hwnd = win32gui.GetForegroundWindow()
+    if hwnd == 0:
+        return 0, ""
+
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    if pid == os.getpid():
+        return 0, ""
+
+    return hwnd, win32gui.GetWindowText(hwnd)
+
+
+def close_window(hwnd: int) -> bool:
+    """지정한 창 핸들에 WM_CLOSE 전송. 자기 자신/없는 창이면 False."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    if pid == os.getpid():
+        return False
+
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    return True
+
+
 def close_active_window() -> bool:
     """현재 활성 창에 WM_CLOSE 메시지 전송 (X 버튼 누른 것과 동일).
     자기 자신은 절대 안 닫음. 닫기 시도했으면 True, 스킵했으면 False 반환."""
